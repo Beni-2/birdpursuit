@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roblox Parrot Flight - Squad Engine</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #87CEEB; font-family: 'Segoe UI', sans-serif; color: white; cursor: pointer; }
+        canvas { display: block; }
+        
+        #loading {
+            position: absolute; inset: 0; display: flex; flex-direction: column;
+            justify-content: center; align-items: center; background: #000; z-index: 200;
+        }
+        .hint { margin-top: 20px; font-size: 14px; color: #888; letter-spacing: 1px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+
+        #audio-indicator {
+            position: absolute; bottom: 20px; left: 20px;
+            font-size: 10px; color: rgba(255,255,255,0.5);
+            pointer-events: none; text-transform: uppercase; letter-spacing: 1px;
+            z-index: 10;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 100;
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 10px 15px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            backdrop-filter: blur(10px);
+            transition: all 0.2s ease;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 100px;
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+
+        .btn:active {
+            transform: scale(0.95);
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div style="font-size: 30px; font-weight: 900; letter-spacing: 5px;">SQUAD SYNC</div>
+        <div class="hint">CLICK ANYWHERE TO START ENGINE & SOUND</div>
+    </div>
+
+    <div id="ui-layer">
+        <button id="audio-btn" class="btn" onclick="toggleMute()">Audio: Off</button>
+    </div>
+
+    <div id="audio-indicator">Audio: Ready (Click to start)</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <script>
+        let scene, camera, renderer, controls, clock = new THREE.Clock();
+        let squad = []; 
+        let worldChunks = new Map();
+        let worldSeed = Math.random() * 5000;
+        let isAutoPilot = true;
+        let isUserMuted = false;
+        const keys = {};
+
+        // Sound Engine
+        let audioCtx, swooshGain, flapGain, bgChirpGain;
+        let bgChirpSource; 
+        let nextChirpTime1 = 0;
+        let nextChirpTime2 = 0;
+
+        const CHUNK_SIZE = 600; 
+        const VIEW_DISTANCE = 3;
+        const BODY_LENGTH = 6.0;
+
+        class Parrot {
+            constructor(colorTheme, isLead = false) {
+                this.isLead = isLead;
+                this.group = new THREE.Group();
+                this.meshParts = {};
+                this.velocity = new THREE.Vector3();
+                this.aiState = 'perched'; 
+                this.targetPos = new THREE.Vector3();
+                this.stateTimer = isLead ? 3.0 : 4.5; 
+                this.radius = 6.0; 
+                this.baseFollowDist = isLead ? 0 : (BODY_LENGTH * 10);
+                this.buildRobloxMesh(colorTheme);
+                scene.add(this.group);
+            }
+
+            createAngelWing(theme, isLeft) {
+                const group = new THREE.Group();
+                const mat = new THREE.MeshStandardMaterial({ color: theme.wing, roughness: 0.1 });
+                const featherCount = 12;
+                for (let i = 0; i < featherCount; i++) {
+                    const featherHeight = 8.0 - i * 0.6;
+                    const feather = new THREE.Mesh(new THREE.BoxGeometry(0.2, featherHeight, 1.8), mat);
+                    feather.position.x = isLeft ? -1.7 * i : 1.7 * i;
+                    feather.position.y = -i * 0.4;
+                    feather.position.z = -i * 0.5;
+                    feather.rotation.z = isLeft ? (i * 0.15) : (-i * 0.15);
+                    feather.rotation.y = isLeft ? (i * 0.08) : (-i * 0.08);
+                    group.add(feather);
+                }
+                const shoulder = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.6, 2.2), mat);
+                group.add(shoulder);
+                return group;
+            }
+
+            buildRobloxMesh(theme) {
+                const mat = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.1 });
+                const bodyGroup = new THREE.Group();
+                const cyl = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.2, 2.5, 8), mat(theme.body));
+                const s1 = new THREE.Mesh(new THREE.SphereGeometry(1.2, 8, 8), mat(theme.body));
+                const s2 = new THREE.Mesh(new THREE.SphereGeometry(1.2, 8, 8), mat(theme.body));
+                s1.position.y = 1.25; s2.position.y = -1.25;
+                bodyGroup.add(cyl, s1, s2);
+                bodyGroup.rotation.x = Math.PI / 2;
+                this.group.add(bodyGroup);
+
+                const head = new THREE.Group();
+                head.position.set(0, 1.5, 1.8);
+                head.add(new THREE.Mesh(new THREE.SphereGeometry(1.1, 12, 12), mat(theme.head)));
+                const beak = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.6, 8), mat(0xFFAA00));
+                beak.position.set(0, -0.3, 0.9); beak.rotation.x = Math.PI/1.5;
+                head.add(beak);
+                this.meshParts.head = head;
+                this.group.add(head);
+
+                this.meshParts.lWing = this.createAngelWing(theme, true);
+                this.meshParts.lWing.position.set(-1.8, 0.6, 0.5);
+                this.meshParts.rWing = this.createAngelWing(theme, false);
+                this.meshParts.rWing.position.set(1.8, 0.6, 0.5);
+                this.group.add(this.meshParts.lWing, this.meshParts.rWing);
+
+                this.meshParts.tail = new THREE.Group();
+                const tPart = new THREE.Mesh(new THREE.BoxGeometry(1.3, 8.5, 0.2), mat(theme.tail || theme.wing));
+                tPart.position.y = 4.25;
+                this.meshParts.tail.add(tPart);
+                this.meshParts.tail.position.set(0, 0, -1.5);
+                this.meshParts.tail.rotation.x = -Math.PI / 2.2;
+                this.group.add(this.meshParts.tail);
+            }
+
+            update(delta, targetEntity, leadFlapFreq) {
+                const time = clock.elapsedTime;
+                this.stateTimer -= delta;
+
+                if (this.isLead) {
+                    if (isAutoPilot) this.updateLeadAI(delta);
+                    else this.updateManual(delta);
+                } else {
+                    this.updateFollowerAI(targetEntity, time);
+                }
+
+                if (this.group.position.y < 3) {
+                    this.group.position.y = 3;
+                    this.velocity.y = Math.max(0, this.velocity.y);
+                }
+
+                this.group.position.add(this.velocity);
+                
+                if (this.aiState !== 'perched') {
+                    const lookTarget = this.group.position.clone().add(this.velocity);
+                    if (this.velocity.length() > 0.05) {
+                        const dummy = new THREE.Object3D();
+                        dummy.position.copy(this.group.position);
+                        dummy.lookAt(lookTarget);
+                        const slerpFactor = this.isLead ? 0.1 : 0.05;
+                        this.group.quaternion.slerp(dummy.quaternion, slerpFactor);
+                    }
+                    
+                    const lateral = new THREE.Vector3(1,0,0).applyQuaternion(this.group.quaternion);
+                    let targetTilt = -this.velocity.dot(lateral) * 1.2;
+                    this.group.rotation.z = THREE.MathUtils.lerp(this.group.rotation.z, targetTilt, 0.08);
+                }
+
+                const flapAmp = (this.aiState === 'perched') ? 0.35 : 1.1;
+                
+                if (this.aiState !== 'perched') {
+                    const rawSin = Math.sin(time * leadFlapFreq);
+                    const solidCycle = Math.sign(rawSin) * Math.pow(Math.abs(rawSin), 0.3);
+                    this.meshParts.lWing.rotation.z = solidCycle * flapAmp;
+                    this.meshParts.rWing.rotation.z = -solidCycle * flapAmp;
+                    this.meshParts.tail.rotation.z = Math.sin(time * 3) * 0.12;
+                } else {
+                    this.meshParts.lWing.rotation.z = THREE.MathUtils.lerp(this.meshParts.lWing.rotation.z, 0.8, 0.1);
+                    this.meshParts.rWing.rotation.z = THREE.MathUtils.lerp(this.meshParts.rWing.rotation.z, -0.8, 0.1);
+                }
+            }
+
+            updateLeadAI(delta) {
+                if (this.aiState === 'perched' && this.stateTimer < 0) {
+                    this.aiState = 'takeoff';
+                    this.targetPos.set(this.group.position.x + 150, 250, this.group.position.z + 500);
+                } else if (this.aiState === 'takeoff' && this.group.position.y > 100) {
+                    this.aiState = 'soaring';
+                } else if (this.aiState === 'soaring' || this.aiState === 'diving') {
+                    if (this.group.position.distanceTo(this.targetPos) < 60 || this.stateTimer < 0) {
+                        const r = Math.random();
+                        if (r < 0.02) { 
+                            let p = findPerch(this.group.position);
+                            if (p) { this.aiState = 'landing'; this.targetPos.copy(p); }
+                            else { this.aiState = 'soaring'; }
+                        } else {
+                            this.aiState = r < 0.4 ? 'diving' : 'soaring';
+                            const range = this.aiState === 'diving' ? 1500 : 4000;
+                            const alt = this.aiState === 'diving' ? 30 + Math.random()*100 : 250 + Math.random()*1000;
+                            this.targetPos.set(this.group.position.x + (Math.random()-0.5)*range, alt, this.group.position.z + (Math.random()-0.5)*range);
+                        }
+                        this.stateTimer = 25 + Math.random()*30; 
+                    }
+                } else if (this.aiState === 'landing' && this.group.position.distanceTo(this.targetPos) < 2) {
+                    this.aiState = 'perched'; this.stateTimer = 5 + Math.random()*5; this.velocity.set(0,0,0);
+                }
+
+                if (this.aiState !== 'perched') {
+                    const steer = new THREE.Vector3().subVectors(this.targetPos, this.group.position).normalize();
+                    const topSpeed = this.aiState === 'diving' ? 15.0 : 7.5;
+                    this.velocity.lerp(steer.multiplyScalar(topSpeed), 0.02);
+                }
+            }
+
+            updateManual(delta) {
+                if (keys['KeyW']) this.group.position.y += 4;
+                if (keys['KeyS']) this.group.position.y -= 4;
+                if (keys['KeyA']) this.group.rotation.y += 0.09;
+                if (keys['KeyD']) this.group.rotation.y -= 0.09;
+                let thrust = keys['Space'] ? 20.0 : 7.5;
+                this.velocity.set(0,0,thrust).applyQuaternion(this.group.quaternion);
+                this.aiState = 'flying';
+            }
+
+            updateFollowerAI(targetParrot, time) {
+                if (!targetParrot) return;
+                if (targetParrot.aiState === 'perched' || targetParrot.aiState === 'landing') {
+                    if (this.aiState !== 'perched' && this.aiState !== 'landing') {
+                        this.aiState = 'landing';
+                        const backDir = new THREE.Vector3(0,0,-this.baseFollowDist).applyQuaternion(targetParrot.group.quaternion);
+                        this.targetPos.copy(targetParrot.group.position).add(backDir);
+                    }
+                    if (this.aiState === 'landing' && this.group.position.distanceTo(this.targetPos) < 3) {
+                        this.aiState = 'perched'; this.velocity.set(0,0,0);
+                    }
+                } else {
+                    if (this.aiState === 'perched') this.aiState = 'takeoff';
+                    const sway = new THREE.Vector3(Math.sin(time*1.2) * 6, Math.cos(time*1.5) * 4, 0).applyQuaternion(targetParrot.group.quaternion);
+                    const chainOffset = new THREE.Vector3(0, 0, -this.baseFollowDist).applyQuaternion(targetParrot.group.quaternion).add(sway);
+                    this.targetPos.copy(targetParrot.group.position).add(chainOffset);
+                    const steer = new THREE.Vector3().subVectors(this.targetPos, this.group.position);
+                    const dist = steer.length();
+                    const followSpeed = dist > 80 ? 35 : dist > 40 ? 20 : 12;
+                    this.velocity.lerp(steer.normalize().multiplyScalar(followSpeed), 0.08); 
+                    this.aiState = 'following';
+                }
+            }
+        }
+
+        window.onload = () => {
+            init();
+            animate();
+            document.getElementById('loading').style.display = 'none';
+        };
+
+        window.addEventListener('mousedown', () => {
+            if (!audioCtx) initAudio();
+        }, { once: false });
+        window.addEventListener('keydown', () => {
+            if (!audioCtx) initAudio();
+        }, { once: false });
+
+        function toggleMute() {
+            isUserMuted = !isUserMuted;
+            const btn = document.getElementById('audio-btn');
+            btn.innerText = isUserMuted ? "Audio: Off" : "Audio: On";
+            
+            if (audioCtx) {
+                if (isUserMuted) {
+                    audioCtx.suspend();
+                } else {
+                    audioCtx.resume();
+                }
+            }
+        }
+
+        function playClickSound() {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(40, audioCtx.currentTime + 0.1);
+            g.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            g.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
+            osc.connect(g);
+            g.connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.1);
+        }
+
+        function chirp(birdIndex) {
+            if (!audioCtx || isUserMuted || audioCtx.state === 'suspended') return;
+            const osc = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            osc.type = 'sine';
+            const baseFreq = birdIndex === 0 ? 1100 : 850;
+            osc.frequency.setValueAtTime(baseFreq + Math.random() * 800, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(3500 + Math.random() * 1500, audioCtx.currentTime + 0.12);
+            g.gain.setValueAtTime(0, audioCtx.currentTime);
+            g.gain.linearRampToValueAtTime(0.04, audioCtx.currentTime + 0.02);
+            g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+            osc.connect(g); g.connect(audioCtx.destination);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+        }
+
+        async function initAudio() {
+            if (audioCtx) return;
+            document.getElementById('audio-indicator').innerText = "Audio: Initializing...";
+            
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                playClickSound(); 
+                
+                // Use fetch + decodeAudioData for more robust loading in sandboxed environment
+                const response = await fetch('chirp.MP3');
+                if (!response.ok) throw new Error('File chirp.MP3 not found');
+                const arrayBuffer = await response.arrayBuffer();
+                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+                // Create Audio Source
+                bgChirpSource = audioCtx.createBufferSource();
+                bgChirpSource.buffer = audioBuffer;
+                bgChirpSource.loop = true;
+                
+                bgChirpGain = audioCtx.createGain();
+                bgChirpGain.gain.value = 0; 
+                
+                bgChirpSource.connect(bgChirpGain);
+                bgChirpGain.connect(audioCtx.destination);
+                bgChirpSource.start(0);
+
+                document.getElementById('audio-indicator').innerText = "Audio: Active";
+                document.getElementById('audio-btn').innerText = "Audio: On";
+
+                // Procedural Swoosh
+                const bufferSize = 4096;
+                const swooshNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
+                swooshGain = audioCtx.createGain();
+                swooshGain.gain.value = 0;
+                swooshNode.onaudioprocess = (e) => {
+                    let out = e.outputBuffer.getChannelData(0);
+                    for (let i = 0; i < bufferSize; i++) out[i] = (Math.random() * 2 - 1) * 0.08;
+                };
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass'; filter.frequency.value = 600;
+                swooshNode.connect(filter); filter.connect(swooshGain); swooshGain.connect(audioCtx.destination);
+
+                // Flap Thrum
+                flapGain = audioCtx.createGain();
+                flapGain.gain.value = 0;
+                const flapOsc = audioCtx.createOscillator();
+                flapOsc.type = 'triangle';
+                flapOsc.frequency.value = 60;
+                const flapFilter = audioCtx.createBiquadFilter();
+                flapFilter.type = 'lowpass'; flapFilter.frequency.value = 200;
+                flapOsc.connect(flapFilter); flapFilter.connect(flapGain); flapGain.connect(audioCtx.destination);
+                flapOsc.start();
+
+                if (audioCtx.state === 'suspended' && !isUserMuted) await audioCtx.resume();
+            } catch (e) {
+                console.warn("Audio loading failed, falling back to procedural:", e);
+                document.getElementById('audio-indicator').innerText = "Audio: Fallback Active";
+            }
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.Fog(0x87CEEB, 150, 3000);
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 40000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+            const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+            sun.position.set(500, 2000, 500);
+            scene.add(sun);
+
+            const startY = 82; 
+            const blue = new Parrot({ body: 0xFFCC00, head: 0x00CCFF, wing: 0x0066FF, tail: 0x0099FF }, true);
+            const red = new Parrot({ body: 0xAA2200, head: 0xFF4400, wing: 0xEE0000, tail: 0xCC0000 }, false);
+            const green = new Parrot({ body: 0xEEEE00, head: 0x00FF00, wing: 0x008800, tail: 0x00AA00 }, false);
+            squad = [blue, red, green];
+
+            squad.forEach((p, i) => p.group.position.set(0, startY, -i * (BODY_LENGTH * 10)));
+            camera.position.set(0, 6, 160); 
+            controls.target.set(0, 6, 0);
+            updateWorld();
+        }
+
+        function findPerch(pos) {
+            let found = null; let minDist = Infinity;
+            worldChunks.forEach(c => c.children.forEach(child => {
+                if (child.userData.perchPoint) {
+                    let d = child.userData.perchPoint.distanceTo(pos);
+                    if (d < 1500 && d < minDist) { minDist = d; found = child.userData.perchPoint; }
+                }
+            }));
+            return found;
+        }
+
+        function generateChunk(cx, cz) {
+            const group = new THREE.Group();
+            group.position.set(cx * CHUNK_SIZE, 0, cz * CHUNK_SIZE);
+            const ground = new THREE.Mesh(new THREE.BoxGeometry(CHUNK_SIZE, 6, CHUNK_SIZE), new THREE.MeshStandardMaterial({ color: 0x2d5a27 }));
+            ground.position.y = -3; group.add(ground);
+            const noise = (Math.sin(cx * 0.5 + worldSeed) * Math.cos(cz * 0.5 + worldSeed));
+            if (noise > 0.35) {
+                const tree = new THREE.Group();
+                tree.position.set((Math.random()-0.5)*CHUNK_SIZE, 0, (Math.random()-0.5)*CHUNK_SIZE);
+                const trunk = new THREE.Mesh(new THREE.CylinderGeometry(6, 8, 400, 8), new THREE.MeshStandardMaterial({color: 0x4a3728}));
+                trunk.position.y = 200; tree.add(trunk);
+                const canopy = new THREE.Mesh(new THREE.SphereGeometry(150, 8, 8), new THREE.MeshStandardMaterial({color: 0x1a3a1a}));
+                canopy.position.y = 450; tree.add(canopy);
+                group.add(tree);
+            }
+            if (cx === 0 && cz === 0) { 
+                const perch = new THREE.Group();
+                const post = new THREE.Mesh(new THREE.BoxGeometry(4, 80, 4), new THREE.MeshStandardMaterial({color: 0x333333}));
+                post.position.y = 40; perch.add(post);
+                const bar = new THREE.Mesh(new THREE.BoxGeometry(100, 4, 4), new THREE.MeshStandardMaterial({color: 0x333333}));
+                bar.position.set(10, 78, 0); perch.add(bar);
+                perch.userData = { perchPoint: new THREE.Vector3(10, 82, 0) }; group.add(perch);
+            } else if (Math.random() > 0.7) {
+                const perch = new THREE.Group();
+                const px = (Math.random()-0.5)*CHUNK_SIZE, pz = (Math.random()-0.5)*CHUNK_SIZE;
+                perch.position.set(px, 0, pz);
+                const post = new THREE.Mesh(new THREE.BoxGeometry(4, 120, 4), new THREE.MeshStandardMaterial({color: 0x333333}));
+                post.position.y = 60; perch.add(post);
+                const bar = new THREE.Mesh(new THREE.BoxGeometry(60, 4, 4), new THREE.MeshStandardMaterial({color: 0x333333}));
+                bar.position.set(10, 118, 0); perch.add(bar);
+                perch.userData = { perchPoint: new THREE.Vector3(cx*CHUNK_SIZE + px + 10, 122, cz*CHUNK_SIZE + pz) };
+                group.add(perch);
+            }
+            return group;
+        }
+
+        function updateWorld() {
+            if (squad.length === 0) return;
+            const px = Math.floor(squad[0].group.position.x / CHUNK_SIZE);
+            const pz = Math.floor(squad[0].group.position.z / CHUNK_SIZE);
+            for (let [key, chunk] of worldChunks) {
+                const [cx, cz] = key.split(',').map(Number);
+                if (Math.abs(cx - px) > VIEW_DISTANCE || Math.abs(cz - pz) > VIEW_DISTANCE) {
+                    scene.remove(chunk); worldChunks.delete(key);
+                }
+            }
+            for (let x = px - VIEW_DISTANCE; x <= px + VIEW_DISTANCE; x++) {
+                for (let z = pz - VIEW_DISTANCE; z <= pz + VIEW_DISTANCE; z++) {
+                    const key = `${x},${z}`;
+                    if (!worldChunks.has(key)) {
+                        const chunk = generateChunk(x, z);
+                        worldChunks.set(key, chunk); scene.add(chunk);
+                    }
+                }
+            }
+        }
+
+        function handlePhysics() {
+            for (let i = 0; i < squad.length; i++) {
+                for (let j = i + 1; j < squad.length; j++) {
+                    const p1 = squad[i]; const p2 = squad[j];
+                    const dist = p1.group.position.distanceTo(p2.group.position);
+                    const minDist = 25; 
+                    if (dist < minDist) {
+                        const push = new THREE.Vector3().subVectors(p1.group.position, p2.group.position).normalize();
+                        const overlap = minDist - dist;
+                        p1.group.position.addScaledVector(push, overlap * 0.5);
+                        p2.group.position.addScaledVector(push, -overlap * 0.5);
+                    }
+                }
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (!camera || !renderer || squad.length < 3) return;
+            const delta = clock.getDelta();
+            const lead = squad[0]; const oldPos = lead.group.position.clone();
+            
+            const leadSpeed = lead.velocity.length();
+            const leadFlapFreq = (lead.aiState === 'perched') ? 0 : 8 + leadSpeed * 1.2; 
+
+            squad[0].update(delta, null, leadFlapFreq);
+            squad[1].update(delta, squad[0], leadFlapFreq);
+            squad[2].update(delta, squad[1], leadFlapFreq);
+            
+            handlePhysics();
+
+            if (audioCtx) {
+                if (bgChirpGain && !isUserMuted) {
+                    const isPerching = (lead.aiState === 'perched' || lead.aiState === 'landing');
+                    const targetVol = isPerching ? 0 : 1.0;
+                    bgChirpGain.gain.setTargetAtTime(targetVol, audioCtx.currentTime, 0.1);
+                    
+                    if (targetVol > 0 && bgChirpGain.gain.value < 0.05) {
+                        document.getElementById('audio-indicator').innerText = "Audio: Fading In...";
+                    } else if (targetVol > 0) {
+                        document.getElementById('audio-indicator').innerText = "Audio: Playing";
+                    } else {
+                        document.getElementById('audio-indicator').innerText = "Audio: Muted (Perched)";
+                    }
+                }
+
+                if (!isUserMuted && audioCtx.state === 'running') {
+                    if (clock.elapsedTime > nextChirpTime1) {
+                        chirp(0); nextChirpTime1 = clock.elapsedTime + 4 + Math.random() * 10;
+                    }
+                    if (clock.elapsedTime > nextChirpTime2) {
+                        chirp(1); nextChirpTime2 = clock.elapsedTime + 6 + Math.random() * 12;
+                    }
+                }
+            }
+            
+            const deltaMove = lead.group.position.clone().sub(oldPos);
+            camera.position.add(deltaMove);
+            let targetCamHeight = Math.max(6, lead.group.position.y + 15);
+            camera.position.y = THREE.MathUtils.lerp(camera.position.y, targetCamHeight, 0.05);
+            controls.target.copy(lead.group.position);
+            updateWorld(); controls.update();
+            
+            if (swooshGain && !isUserMuted) {
+                const speedVol = Math.min(leadSpeed * 0.015, 0.1);
+                swooshGain.gain.setTargetAtTime(speedVol, audioCtx.currentTime, 0.1);
+                const pulse = Math.max(0, Math.sin(clock.elapsedTime * leadFlapFreq));
+                if (flapGain) flapGain.gain.setTargetAtTime(pulse * speedVol * 1.5, audioCtx.currentTime, 0.05);
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            if (!camera || !renderer) return;
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+    </script>
+</body>
+</html>
